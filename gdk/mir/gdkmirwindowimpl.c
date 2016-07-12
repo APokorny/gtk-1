@@ -65,6 +65,8 @@ struct _GdkMirWindowImpl
   /* Surface being rendered to (only exists when window visible) */
   MirSurface *surface;
   MirBufferStream *buffer_stream;
+  gint stream_width;
+  gint stream_height;
 
   MirBufferUsage buffer_usage;
 
@@ -388,6 +390,36 @@ apply_geometry_hints (MirSurfaceSpec *spec, GdkMirWindowImpl *impl)
     }
 }
 
+static void
+create_buffer_stream (GdkWindow *window, GdkMirWindowImpl *impl, MirSurfaceSpec *spec)
+{
+  MirConnection *connection = gdk_mir_display_get_mir_connection (impl->display);
+  MirPixelFormat format = _gdk_mir_display_get_pixel_format (impl->display, impl->buffer_usage);
+  MirBufferStreamInfo streams[1];
+
+  if (impl->buffer_stream && (window->height != impl->stream_height || window->width != impl->stream_width))
+    mir_buffer_stream_release (impl->buffer_stream, NULL, NULL);
+  else
+    return;
+
+  if (impl->cairo_surface)
+    {
+      cairo_surface_finish (impl->cairo_surface);
+      g_clear_pointer (&impl->cairo_surface, cairo_surface_destroy);
+    }
+
+  impl->buffer_stream = mir_connection_create_buffer_stream_sync (connection, window->width, window->height, format, impl->buffer_usage);
+  impl->stream_width = window->width;
+  impl->stream_height = window->height;
+  mir_buffer_stream_set_scale (impl->buffer_stream, (float) impl->output_scale);
+
+  streams[0].stream = impl->buffer_stream;
+  streams[0].displacement_x = 0;
+  streams[0].displacement_y = 0;
+
+  mir_surface_spec_set_streams (spec, streams, 1);
+}
+
 static MirSurfaceSpec*
 create_spec (GdkWindow *window, GdkMirWindowImpl *impl)
 {
@@ -419,10 +451,10 @@ update_surface_spec (GdkWindow *window)
 
   spec = create_spec (window, impl);
 
+  create_buffer_stream (window, impl, spec);
   mir_surface_apply_spec (impl->surface, spec);
   mir_surface_spec_release (spec);
   impl->pending_spec_update = FALSE;
-  impl->buffer_stream = mir_surface_get_buffer_stream (impl->surface);
 }
 
 static GdkDevice *
@@ -492,6 +524,8 @@ ensure_surface_full (GdkWindow *window,
   impl->buffer_usage = buffer_usage;
 
   spec = create_spec (window, impl);
+
+  create_buffer_stream (window, impl, spec);
 
   impl->surface = mir_surface_create_sync (spec);
 
@@ -587,11 +621,6 @@ on_frame_clock_after_paint (GdkFrameClock *clock,
   impl->pending_commit = FALSE;
   _gdk_frame_clock_freeze (clock);
 
-  if (impl->pending_spec_update)
-    update_surface_spec (window);
-
-  impl->pending_spec_update = FALSE;
-
   /* Send the completed buffer to Mir */
   impl->pending_swap = TRUE;
   mir_buffer_stream_swap_buffers (impl->buffer_stream, on_swap_buffer_completed, window);
@@ -643,7 +672,7 @@ gdk_mir_window_impl_ref_cairo_surface (GdkWindow *window)
     {
       ensure_surface (window);
 
-      mir_buffer_stream_get_graphics_region (mir_surface_get_buffer_stream (impl->surface), &region);
+      mir_buffer_stream_get_graphics_region (impl->buffer_stream, &region);
 
       switch (region.pixel_format)
         {
