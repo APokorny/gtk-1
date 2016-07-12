@@ -29,6 +29,7 @@
 #include "gdkintl.h"
 #include "gdkdisplayprivate.h"
 #include "gdkdeviceprivate.h"
+#include "gdkframeclockprivate.h"
 
 #define GDK_MIR_WINDOW_IMPL_CLASS(klass)      (G_TYPE_CHECK_CLASS_CAST ((klass), GDK_TYPE_WINDOW_IMPL_MIR, GdkMirWindowImplClass))
 #define GDK_IS_WINDOW_IMPL_MIR_CLASS(klass)   (G_TYPE_CHECK_CLASS_TYPE ((klass), GDK_TYPE_WINDOW_IMPL_MIR))
@@ -87,6 +88,9 @@ struct _GdkMirWindowImpl
   /* TRUE if cursor is inside this window */
   gboolean cursor_inside;
 
+  gboolean pending_redraw;
+  gboolean pending_commit;
+  gboolean pending_swap;
   gboolean pending_spec_update;
   gint output_scale;
 };
@@ -99,6 +103,7 @@ struct _GdkMirWindowImplClass
 G_DEFINE_TYPE (GdkMirWindowImpl, gdk_mir_window_impl, GDK_TYPE_WINDOW_IMPL)
 
 static cairo_surface_t *gdk_mir_window_impl_ref_cairo_surface (GdkWindow *window);
+static void on_frame_clock_after_paint (GdkFrameClock *clock, GdkWindow *window);
 static void ensure_surface (GdkWindow *window);
 static void apply_geometry_hints (MirSurfaceSpec *spec, GdkMirWindowImpl *impl);
 
@@ -167,6 +172,7 @@ get_default_title (void)
 GdkWindowImpl *
 _gdk_mir_window_impl_new (GdkDisplay *display, GdkWindow *window, GdkWindowAttr *attributes, gint attributes_mask)
 {
+  GdkFrameClock *frame_clock = gdk_window_get_frame_clock (window);
   GdkMirWindowImpl *impl = g_object_new (GDK_TYPE_MIR_WINDOW_IMPL, NULL);
 
   impl->display = display;
@@ -180,6 +186,12 @@ _gdk_mir_window_impl_new (GdkDisplay *display, GdkWindow *window, GdkWindowAttr 
     impl->type_hint = attributes->type_hint;
 
   impl->pending_spec_update = TRUE;
+
+  if (window->window_type != GDK_WINDOW_ROOT)
+    {
+      g_signal_connect (frame_clock, "after-paint",
+                        G_CALLBACK (on_frame_clock_after_paint), window);
+    }
 
   return (GdkWindowImpl *) impl;
 }
@@ -545,23 +557,63 @@ ensure_no_surface (GdkWindow *window, GdkMirWindowImpl *impl)
         }
     }
 
+  impl->pending_commit = FALSE;
+  impl->pending_swap = FALSE;
   g_clear_pointer(&impl->surface, mir_surface_release_sync);
+}
+
+static void
+on_swap_buffer_completed (MirBufferStream *stream, void *data)
+{
+  GdkWindow *window = data;
+  GdkMirWindowImpl *impl = GDK_MIR_WINDOW_IMPL (window->impl);
+
+  /* The Cairo context is no longer valid */
+  g_clear_pointer (&impl->cairo_surface, cairo_surface_destroy);
+  impl->pending_swap = FALSE;
+
+  _gdk_frame_clock_thaw (gdk_window_get_frame_clock (window));
+}
+
+static void
+on_frame_clock_after_paint (GdkFrameClock *clock,
+                            GdkWindow     *window)
+{
+  GdkMirWindowImpl *impl = GDK_MIR_WINDOW_IMPL (window->impl);
+
+  if (!impl->pending_commit)
+    return;
+
+  impl->pending_commit = FALSE;
+  _gdk_frame_clock_freeze (clock);
+
+  if (impl->pending_spec_update)
+    update_surface_spec (window);
+
+  impl->pending_spec_update = FALSE;
+
+  /* Send the completed buffer to Mir */
+  impl->pending_swap = TRUE;
+  mir_buffer_stream_swap_buffers (impl->buffer_stream, on_swap_buffer_completed, window);
+}
+
+static void
+send_buffer_delayed (GdkWindow *window)
+{
+  GdkMirWindowImpl *impl = GDK_MIR_WINDOW_IMPL (window->impl);
+
+  if (impl->pending_swap || impl->pending_commit)
+    return;
+
+  impl->pending_commit = TRUE;
 }
 
 static void
 send_buffer (GdkWindow *window)
 {
-  GdkMirWindowImpl *impl = GDK_MIR_WINDOW_IMPL (window->impl);
-
-  /* Send the completed buffer to Mir */
-  mir_buffer_stream_swap_buffers_sync (mir_surface_get_buffer_stream (impl->surface));
-
-  /* The Cairo context is no longer valid */
-  g_clear_pointer (&impl->cairo_surface, cairo_surface_destroy);
-  if (impl->pending_spec_update)
-    update_surface_spec (window);
-
-  impl->pending_spec_update = FALSE;
+  send_buffer_delayed (window);
+  gdk_frame_clock_request_phase (gdk_window_get_frame_clock (window),
+                                 GDK_FRAME_CLOCK_PHASE_AFTER_PAINT);
 }
 
 static cairo_surface_t *
@@ -786,6 +838,7 @@ gdk_mir_window_impl_move_resize (GdkWindow *window,
     /* We accept any resize */
     window->width = width;
     window->height = height;
+    impl->pending_redraw = TRUE;
     impl->pending_spec_update = TRUE;
   }
 
@@ -917,9 +970,12 @@ gdk_mir_window_impl_get_device_state (GdkWindow       *window,
 static gboolean
 gdk_mir_window_impl_begin_paint (GdkWindow *window)
 {
+  GdkMirWindowImpl *impl = GDK_MIR_WINDOW_IMPL (window->impl);
+
+  ensure_surface (window);
   //g_printerr ("gdk_mir_window_impl_begin_paint window=%p\n", window);
   /* Indicate we are ready to be drawn onto directly? */
-  return FALSE;
+  return impl->pending_swap;
 }
 
 static void
