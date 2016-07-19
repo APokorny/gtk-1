@@ -81,6 +81,7 @@ struct _GdkMirWindowImpl
   /* TRUE if cursor is inside this window */
   gboolean cursor_inside;
 
+  gboolean pending_spec_update;
   gint output_scale;
 };
 
@@ -111,6 +112,8 @@ _gdk_mir_window_impl_new (GdkDisplay *display, GdkWindow *window, GdkWindowAttr 
 
   if (attributes && attributes_mask & GDK_WA_TYPE_HINT)
     impl->type_hint = attributes->type_hint;
+
+  impl->pending_spec_update = TRUE;
 
   return (GdkWindowImpl *) impl;
 }
@@ -169,12 +172,18 @@ static void
 set_surface_state (GdkMirWindowImpl *impl,
                    MirSurfaceState state)
 {
+  MirConnection *connection = gdk_mir_display_get_mir_connection (impl->display);
   if (impl->surface_state == state)
     return;
 
   impl->surface_state = state;
-  if (impl->surface)
-    mir_surface_set_state (impl->surface, state);
+  if (impl->surface && !impl->pending_spec_update)
+    {
+      MirSurfaceSpec *spec = mir_connection_create_spec_for_changes (connection);
+      mir_surface_spec_set_state (spec, state);
+      mir_surface_apply_spec (impl->surface, spec);
+      mir_surface_spec_release (spec);
+    }
 }
 
 static void
@@ -307,6 +316,7 @@ update_surface_spec (GdkWindow *window)
 
   mir_surface_apply_spec (impl->surface, spec);
   mir_surface_spec_release (spec);
+  impl->pending_spec_update = FALSE;
   impl->buffer_stream = mir_surface_get_buffer_stream (impl->surface);
 }
 
@@ -364,7 +374,11 @@ ensure_surface_full (GdkWindow *window,
   MirSurfaceSpec *spec;
 
   if (impl->surface)
-    return;
+    {
+      if (impl->pending_spec_update)
+        update_surface_spec(window);
+      return;
+    }
 
   /* no destroy notify -- we must leak for now
    * https://bugs.launchpad.net/mir/+bug/1324100
@@ -377,6 +391,8 @@ ensure_surface_full (GdkWindow *window,
   impl->surface = mir_surface_create_sync (spec);
 
   mir_surface_spec_release(spec);
+
+  impl->pending_spec_update = FALSE;
   impl->buffer_stream = mir_surface_get_buffer_stream (impl->surface);
 
   /* FIXME: can't make an initial resize event */
@@ -449,6 +465,10 @@ send_buffer (GdkWindow *window)
 
   /* The Cairo context is no longer valid */
   g_clear_pointer (&impl->cairo_surface, cairo_surface_destroy);
+  if (impl->pending_spec_update)
+    update_surface_spec (window);
+
+  impl->pending_spec_update = FALSE;
 }
 
 static cairo_surface_t *
@@ -669,6 +689,7 @@ gdk_mir_window_impl_move_resize (GdkWindow *window,
     /* We accept any resize */
     window->width = width;
     window->height = height;
+    impl->pending_spec_update = TRUE;
   }
 
   /* Transient windows can move wherever they want */
@@ -678,7 +699,8 @@ gdk_mir_window_impl_move_resize (GdkWindow *window,
         {
           impl->transient_x = x;
           impl->transient_y = y;
-          update_surface_spec (window);
+          if (!impl->pending_spec_update && impl->surface)
+            update_surface_spec (window);
         }
     }
 }
@@ -879,7 +901,8 @@ gdk_mir_window_impl_set_type_hint (GdkWindow         *window,
   if (hint != impl->type_hint)
     {
       impl->type_hint = hint;
-      update_surface_spec (window);
+      if (impl->surface && !impl->pending_spec_update)
+        update_surface_spec (window);
     }
 }
 
@@ -962,6 +985,9 @@ gdk_mir_window_impl_set_transient_for (GdkWindow *window,
 
   /* Link this window to the parent */
   impl->transient_for = parent;
+
+  if (impl->surface && !impl->pending_spec_update)
+    update_surface_spec (window);
 }
 
 static void
