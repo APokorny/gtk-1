@@ -323,6 +323,9 @@ create_window_type_spec (GdkDisplay *display,
       case GDK_WINDOW_TYPE_HINT_POPUP_MENU:
       case GDK_WINDOW_TYPE_HINT_TOOLBAR:
       case GDK_WINDOW_TYPE_HINT_COMBO:
+      case GDK_WINDOW_TYPE_HINT_DND:
+      case GDK_WINDOW_TYPE_HINT_TOOLTIP:
+      case GDK_WINDOW_TYPE_HINT_NOTIFICATION:
         rect.left = x;
         rect.top = y;
         rect.width = 1;
@@ -341,19 +344,6 @@ create_window_type_spec (GdkDisplay *display,
                                                             height,
                                                             format,
                                                             parent_surface);
-      case GDK_WINDOW_TYPE_HINT_DND:
-      case GDK_WINDOW_TYPE_HINT_TOOLTIP:
-      case GDK_WINDOW_TYPE_HINT_NOTIFICATION:
-        rect.left = x;
-        rect.top = y;
-        rect.width = 1;
-        rect.height = 1;
-        return mir_connection_create_spec_for_tooltip (connection,
-                                                       width,
-                                                       height,
-                                                       format,
-                                                       parent_surface,
-                                                       &rect);
         break;
       case GDK_WINDOW_TYPE_HINT_NORMAL:
       case GDK_WINDOW_TYPE_HINT_DESKTOP:
