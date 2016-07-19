@@ -16,6 +16,7 @@
  */
 
 #include <inttypes.h>
+#include <math.h>
 
 #include "config.h"
 
@@ -60,6 +61,7 @@ struct _GdkMirWindowImpl
 
   /* Surface being rendered to (only exists when window visible) */
   MirSurface *surface;
+  MirBufferStream *buffer_stream;
 
   /* Cairo context for current frame */
   cairo_surface_t *cairo_surface;
@@ -75,6 +77,8 @@ struct _GdkMirWindowImpl
 
   /* TRUE if cursor is inside this window */
   gboolean cursor_inside;
+
+  gint output_scale;
 };
 
 struct _GdkMirWindowImplClass
@@ -85,6 +89,14 @@ struct _GdkMirWindowImplClass
 G_DEFINE_TYPE (GdkMirWindowImpl, gdk_mir_window_impl, GDK_TYPE_WINDOW_IMPL)
 
 static cairo_surface_t *gdk_mir_window_impl_ref_cairo_surface (GdkWindow *window);
+
+static void
+drop_cairo_surface (GdkWindow *window)
+{
+  GdkMirWindowImpl *impl = GDK_MIR_WINDOW_IMPL (window->impl);
+
+  g_clear_pointer (&impl->cairo_surface, cairo_surface_destroy);
+}
 
 GdkWindowImpl *
 _gdk_mir_window_impl_new (void)
@@ -139,6 +151,7 @@ gdk_mir_window_impl_init (GdkMirWindowImpl *impl)
 {
   impl->type_hint = GDK_WINDOW_TYPE_HINT_NORMAL;
   impl->surface_state = mir_surface_state_unknown;
+  impl->output_scale = 1;
 }
 
 static void
@@ -333,6 +346,7 @@ ensure_surface_full (GdkWindow *window,
                                       window->width, window->height,
                                       impl->type_hint,
                                       buffer_usage);
+  impl->buffer_stream = mir_surface_get_buffer_stream (impl->surface);
 
   /* FIXME: can't make an initial resize event */
   // MirEvent *resize_event;
@@ -425,6 +439,7 @@ gdk_mir_window_impl_ref_cairo_surface (GdkWindow *window)
   if (window->gl_paint_context)
     {
       cairo_surface = cairo_image_surface_create (pixel_format, window->width, window->height);
+      cairo_surface_set_device_scale (cairo_surface, (double) impl->output_scale, (double) impl->output_scale);
     }
   else if (impl->visible)
     {
@@ -473,6 +488,7 @@ gdk_mir_window_impl_ref_cairo_surface (GdkWindow *window)
                                                            region.width,
                                                            region.height,
                                                            region.stride);
+      cairo_surface_set_device_scale (cairo_surface, (double) impl->output_scale, (double) impl->output_scale);
     }
   else
     cairo_surface = cairo_image_surface_create (pixel_format, 0, 0);
@@ -1247,8 +1263,8 @@ static gint
 gdk_mir_window_impl_get_scale_factor (GdkWindow *window)
 {
   //g_printerr ("gdk_mir_window_impl_get_scale_factor window=%p\n", window);
-  /* Don't support monitor scaling */
-  return 1;
+  GdkMirWindowImpl *impl = GDK_MIR_WINDOW_IMPL (window->impl);
+  return impl->output_scale;
 }
 
 static void
@@ -1504,6 +1520,30 @@ gdk_mir_window_get_mir_surface (GdkWindow *window)
   impl = GDK_MIR_WINDOW_IMPL (window->impl);
 
   return impl->surface;
+}
+
+void
+_gdk_mir_window_set_surface_output (GdkWindow *window, gdouble scale)
+{
+  // g_printerr ("_gdk_mir_window_impl_set_surface_output impl=%p\n", impl);
+  GdkMirWindowImpl *impl = GDK_MIR_WINDOW_IMPL (window->impl);
+  GdkRectangle area = {0, 0, window->width, window->height};
+  cairo_region_t *region;
+  gint new_scale = (gint) round (scale);
+
+  if (impl->output_scale != new_scale)
+    {
+      impl->output_scale = new_scale;
+
+      drop_cairo_surface (window);
+
+      if (impl->buffer_stream)
+        mir_buffer_stream_set_scale (impl->buffer_stream, (float) new_scale);
+
+      region = cairo_region_create_rectangle (&area);
+      _gdk_window_invalidate_for_expose (window, region);
+      cairo_region_destroy (region);
+    }
 }
 
 static void
